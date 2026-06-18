@@ -145,6 +145,11 @@ in
         # incus CLI writes its config to ~/.config/incus, but the service user
         # has no writable home. Point it at the state directory instead.
         INCUS_CONF = "/var/lib/incus-redfish/.config";
+        # Use the absolute path so the service doesn't depend on PATH containing
+        # the incus/lxc binary (systemd services run with a restricted PATH).
+        REDFISH_CLI = if cfg.backend == "lxd"
+          then "${pkgs.lxd}/bin/lxc"
+          else "${pkgs.incus}/bin/incus";
       };
 
       serviceConfig = {
