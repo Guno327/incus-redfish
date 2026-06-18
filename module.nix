@@ -142,6 +142,9 @@ in
         # REDFISH_BACKEND is read at module import time, before gunicorn serves
         # any requests, so it must be set here rather than in environmentFile.
         REDFISH_BACKEND = cfg.backend;
+        # incus CLI writes its config to ~/.config/incus, but the service user
+        # has no writable home. Point it at the state directory instead.
+        INCUS_CONF = "/var/lib/incus-redfish/.config";
       };
 
       serviceConfig = {
