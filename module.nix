@@ -16,6 +16,14 @@ let
 
   tlsFlags = lib.optionalString cfg.tls "--certfile ${certFile} --keyfile ${keyFile}";
 
+  # Add the bind address to the cert's SAN list when it is a specific address
+  # rather than a wildcard, so MAAS can reach the emulator without hostname
+  # mismatch errors.
+  hostIsWildcard = cfg.host == "0.0.0.0" || cfg.host == "::";
+  hostIsIp = builtins.match "[0-9].*" cfg.host != null || lib.hasInfix ":" cfg.host;
+  extraSan = lib.optionalString (!hostIsWildcard)
+    (if hostIsIp then ",IP:${cfg.host}" else ",DNS:${cfg.host}");
+
   precertScript = pkgs.writeShellScript "incus-redfish-precert" ''
     if [ ! -f ${autoCert} ]; then
       ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:2048 \
@@ -23,7 +31,7 @@ let
         -out ${autoCert} \
         -days 3650 -nodes \
         -subj '/CN=incus-redfish' \
-        -addext 'subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost'
+        -addext 'subjectAltName=IP:127.0.0.1,IP:::1,DNS:localhost${extraSan}'
       chmod 600 ${autoKey}
     fi
   '';

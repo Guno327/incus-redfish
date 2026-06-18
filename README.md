@@ -157,13 +157,15 @@ REDFISH_PASSWORD=change-me
 
 This produces an HTTPS service on `0.0.0.0:8443`. On first start a self-signed TLS certificate is generated and cached at `/var/lib/incus-redfish/cert.pem` (delete to regenerate).
 
+When `host` is set to a specific address (anything other than `0.0.0.0` or `::`), that address is automatically added to the certificate's Subject Alternative Names so MAAS can reach the emulator without a hostname mismatch. For example, `host = "10.0.0.5"` produces a cert with SANs for `localhost`, `127.0.0.1`, `::1`, and `10.0.0.5`. This applies only to the auto-generated certificate; bring-your-own certs are used as-is.
+
 ### Module options
 
 | Option | Default | Description |
 |---|---|---|
 | `enable` | `false` | Enable the service. |
 | `environmentFile` | `null` | Path to a file loaded as systemd `EnvironmentFile=`. Use for `REDFISH_PASSWORD` and other secrets. |
-| `host` | `"0.0.0.0"` | Bind address. |
+| `host` | `"0.0.0.0"` | Bind address. A specific address (not `0.0.0.0` / `::`) is automatically added to the auto-generated TLS certificate's SANs. |
 | `port` | `8443` | TCP port. |
 | `tls` | `true` | Serve HTTPS. Set to `false` if terminating TLS at a reverse proxy. |
 | `tlsCertFile` | `null` | Path to a PEM certificate. When null a self-signed cert is auto-generated. |
