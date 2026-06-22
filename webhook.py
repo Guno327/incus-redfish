@@ -22,6 +22,7 @@ existing PEM files; otherwise a self-signed cert is generated and cached at
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 from functools import wraps
@@ -29,7 +30,26 @@ from hashlib import sha1
 
 from flask import Flask, Response, jsonify, request
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s incus-redfish %(message)s",
+)
+log = logging.getLogger("incus_redfish")
+
 app = Flask(__name__)
+
+
+@app.after_request
+def _log_response(resp):
+    body = resp.get_data(as_text=False)
+    preview = body[:300].decode("utf-8", errors="replace") if body else ""
+    log.info(
+        "%s %s → %s ct=%s body=%r",
+        request.method, request.path,
+        resp.status, resp.content_type, preview,
+    )
+    return resp
+
 
 USERNAME = os.environ.get("REDFISH_USERNAME", "admin")
 PASSWORD = os.environ.get("REDFISH_PASSWORD", "password")
@@ -254,6 +274,12 @@ def _system_payload(system_id, project, name, status):
     return payload, state
 
 
+@app.route("/redfish/v1/SessionService/Sessions", methods=["POST"])
+def create_session():
+    return _error(405, "Base.1.0.ActionNotSupported",
+                  "Session auth not supported; use HTTP Basic")
+
+
 @app.route("/redfish/v1/Systems/<system_id>", methods=["GET"])
 @requires_auth
 def get_system(system_id):
@@ -292,7 +318,7 @@ def patch_system(system_id):
     boot = body.get("Boot")
     if boot is not None and not isinstance(boot, dict):
         return _error(400, "Base.1.0.PropertyValueTypeError", "Boot must be an object")
-    return ("", 204)
+    return Response(status=204)
 
 
 # ---------- reset action ----------
@@ -344,11 +370,17 @@ def reset_system(system_id):
 
     ok, out = _run(base + [name, "--project", project])
     if ok:
-        return ("", 204)
+        return Response(status=204)
     # Treat idempotent failures as success.
+    # Incus says "already stopped"/"already running"; LXD says "not running".
     lowered = out.lower()
-    if "already running" in lowered or "already stopped" in lowered:
-        return ("", 204)
+    if (
+        "already running" in lowered
+        or "already stopped" in lowered
+        or "not running" in lowered
+    ):
+        return Response(status=204)
+    log.error("incus command failed for %s: %s", name, out)
     return _error(500, "Base.1.0.InternalError", out or "incus command failed")
 
 
