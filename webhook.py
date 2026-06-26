@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import subprocess
+import threading
 from functools import wraps
 from hashlib import sha1
 
@@ -70,14 +71,46 @@ ID_SEP = "_"
 
 # ---------- incus helpers ----------
 
+_CLI_TIMEOUT = 15  # seconds; keeps gunicorn workers from blocking indefinitely
+
+
 def _run(cmd):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                           timeout=_CLI_TIMEOUT)
         return True, r.stdout
+    except subprocess.TimeoutExpired:
+        return False, f"{CLI} CLI timed out after {_CLI_TIMEOUT}s"
     except subprocess.CalledProcessError as e:
         return False, (e.stderr or e.stdout or "").strip()
     except FileNotFoundError:
         return False, f"{CLI} CLI not found on PATH"
+
+
+_IDEMPOTENT_PHRASES = ("already running", "already stopped", "not running")
+
+
+def _run_nowait(cmd):
+    """Start cmd in a background thread; return immediately.
+
+    Used for power-state changes (stop/start/restart) that can take longer
+    than the gunicorn worker timeout. MAAS polls PowerState separately, so it
+    is safe to return 204 as soon as the operation is dispatched.
+    """
+    def _bg():
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                out = (r.stderr or r.stdout or "").strip()
+                lowered = out.lower()
+                if not any(p in lowered for p in _IDEMPOTENT_PHRASES):
+                    log.error("background command %s exited %d: %s",
+                              cmd, r.returncode, out)
+        except Exception as exc:
+            log.error("background command %s failed: %s", cmd, exc)
+
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
 
 
 def list_instances():
@@ -112,9 +145,12 @@ def resolve_id(system_id: str):
     """
     instances = list_instances()
     # Exact {project}_{vm} match
-    for inst in instances:
-        if encode_id(inst["project"], inst["name"]) == system_id:
-            return inst["project"], inst["name"]
+    exact = [i for i in instances if encode_id(i["project"], i["name"]) == system_id]
+    if len(exact) > 1:
+        log.warning("system_id %r is ambiguous — matches %s; using first",
+                    system_id, [(i["project"], i["name"]) for i in exact])
+    if exact:
+        return exact[0]["project"], exact[0]["name"]
     # Bare VM name fallback
     matches = [i for i in instances if i["name"] == system_id]
     if matches:
@@ -275,6 +311,7 @@ def _system_payload(system_id, project, name, status):
 
 
 @app.route("/redfish/v1/SessionService/Sessions", methods=["POST"])
+@requires_auth
 def create_session():
     return _error(405, "Base.1.0.ActionNotSupported",
                   "Session auth not supported; use HTTP Basic")
@@ -288,7 +325,7 @@ def get_system(system_id):
         return _not_found(system_id)
     # Re-query the specific instance for fresh status.
     ok, out = _run([CLI, "list", name, "--project", project, "--format", "json"])
-    status = ""
+    status = None
     if ok:
         try:
             arr = json.loads(out)
@@ -298,6 +335,9 @@ def get_system(system_id):
                     break
         except json.JSONDecodeError:
             pass
+    if status is None:
+        # Instance vanished between resolve_id and the list call.
+        return _not_found(system_id)
     payload, state = _system_payload(system_id, project, name, status)
     return redfish_json(payload, etag=system_etag(system_id, state))
 
@@ -326,10 +366,10 @@ def patch_system(system_id):
 RESET_MAP = {
     "On":               [CLI, "start"],
     "ForceOn":          [CLI, "start"],
-    "ForceOff":         [CLI, "stop", "-f"],
+    "ForceOff":         [CLI, "stop", "--force"],
     "GracefulShutdown": [CLI, "stop"],
     "GracefulRestart":  [CLI, "restart"],
-    "ForceRestart":     [CLI, "restart", "-f"],
+    "ForceRestart":     [CLI, "restart", "--force"],
     "PushPowerButton":  None,  # handled specially: toggle
     "Nmi":              None,  # unsupported
 }
@@ -361,27 +401,15 @@ def reset_system(system_id):
                         break
             except json.JSONDecodeError:
                 pass
-        base = [CLI, "stop", "-f"] if running else [CLI, "start"]
+        base = [CLI, "stop", "--force"] if running else [CLI, "start"]
     elif reset_type == "Nmi":
         return _error(501, "Base.1.0.ActionNotSupported",
                       "Nmi is not supported on this backend")
     else:
         base = list(RESET_MAP[reset_type])
 
-    ok, out = _run(base + [name, "--project", project])
-    if ok:
-        return Response(status=204)
-    # Treat idempotent failures as success.
-    # Incus says "already stopped"/"already running"; LXD says "not running".
-    lowered = out.lower()
-    if (
-        "already running" in lowered
-        or "already stopped" in lowered
-        or "not running" in lowered
-    ):
-        return Response(status=204)
-    log.error("incus command failed for %s: %s", name, out)
-    return _error(500, "Base.1.0.InternalError", out or "incus command failed")
+    _run_nowait(base + [name, "--project", project])
+    return Response(status=204)
 
 
 # ---------- errors ----------
@@ -433,7 +461,7 @@ def ensure_self_signed(cert_path, key_path):
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "incus-redfish")])
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     sans = [
         x509.DNSName("localhost"),
         x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
